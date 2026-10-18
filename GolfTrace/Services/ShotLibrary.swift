@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 final class ShotLibrary {
     private let fileManager = FileManager.default
@@ -47,12 +48,57 @@ final class ShotLibrary {
             id: id,
             createdAt: Date(),
             videoFileName: fileName,
-            trace: ShotTrace(points: [], confidence: 0, videoWidth: 0, videoHeight: 0)
+            mediaType: .video,
+            trace: ShotTrace(points: [], videoWidth: 0, videoHeight: 0)
         )
     }
 
     func videoURL(for shot: ShotRecord) -> URL {
         rootURL.appendingPathComponent(shot.videoFileName)
+    }
+
+    func mediaURL(for shot: ShotRecord) -> URL {
+        switch shot.mediaType {
+        case .video:
+            return videoURL(for: shot)
+        case .image:
+            let name = shot.imageFileName ?? shot.videoFileName
+            return rootURL.appendingPathComponent(name)
+        }
+    }
+
+    func importImage(from sourceURL: URL) throws -> ShotRecord {
+        let accessed = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if accessed {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        let id = UUID()
+        let ext = sourceURL.pathExtension.isEmpty ? "jpg" : sourceURL.pathExtension
+        let fileName = "\(id.uuidString).\(ext)"
+        let destination = rootURL.appendingPathComponent(fileName)
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.copyItem(at: sourceURL, to: destination)
+
+        // 读取像素尺寸，用于回放页按比例摆放轨迹
+        var width = 0.0
+        var height = 0.0
+        if let image = UIImage(contentsOfFile: destination.path) {
+            width = Double(image.size.width * image.scale)
+            height = Double(image.size.height * image.scale)
+        }
+
+        return ShotRecord(
+            id: id,
+            createdAt: Date(),
+            videoFileName: "",
+            imageFileName: fileName,
+            mediaType: .image,
+            trace: ShotTrace(points: [], videoWidth: width, videoHeight: height)
+        )
     }
 
     func save(_ shot: ShotRecord) throws {
@@ -79,6 +125,9 @@ final class ShotLibrary {
     func delete(_ shot: ShotRecord) {
         try? fileManager.removeItem(at: rootURL.appendingPathComponent("\(shot.id.uuidString).json"))
         try? fileManager.removeItem(at: videoURL(for: shot))
+        if let imageFileName = shot.imageFileName {
+            try? fileManager.removeItem(at: rootURL.appendingPathComponent(imageFileName))
+        }
         let index = loadIndex().filter { $0.id != shot.id }
         try? encoder.encode(index).write(to: indexURL, options: .atomic)
     }
@@ -87,5 +136,9 @@ final class ShotLibrary {
 extension ShotRecord {
     var videoURL: URL {
         ShotLibrary().videoURL(for: self)
+    }
+
+    var mediaURL: URL {
+        ShotLibrary().mediaURL(for: self)
     }
 }

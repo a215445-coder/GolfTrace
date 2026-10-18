@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 
 struct HomeView: View {
     @EnvironmentObject private var session: AppSession
-    @State private var pickedItem: PhotosPickerItem?
+    @State private var pickedVideo: PhotosPickerItem?
+    @State private var pickedImage: PhotosPickerItem?
 
     var body: some View {
         NavigationStack {
@@ -16,11 +17,6 @@ struct HomeView: View {
                 }
             }
         }
-        .overlay {
-            if session.isProcessing {
-                processingOverlay
-            }
-        }
         .alert("出错了", isPresented: Binding(
             get: { session.errorMessage != nil },
             set: { if !$0 { session.errorMessage = nil } }
@@ -29,9 +25,22 @@ struct HomeView: View {
         } message: {
             Text(session.errorMessage ?? "")
         }
-        .onChange(of: pickedItem) { _, item in
+        .onChange(of: pickedVideo) { _, item in
             guard let item else { return }
-            Task { await importPickedVideo(item) }
+            Task { await importPicked(item, as: .video) }
+        }
+        .onChange(of: pickedImage) { _, item in
+            guard let item else { return }
+            Task { await importPicked(item, as: .image) }
+        }
+        .onAppear {
+#if DEBUG
+            // 仅调试用：-autoOpen 启动时直接打开最近一条记录（配合自动化截图检查）
+            if ProcessInfo.processInfo.arguments.contains("-autoOpen"),
+               let first = session.library.first {
+                session.open(first)
+            }
+#endif
         }
     }
 
@@ -41,21 +50,27 @@ struct HomeView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("记录球的飞行轨迹")
                         .font(.largeTitle.bold())
-                    Text("把手机固定好，让球飞过画面。识别失败时可以暂停后点选球的位置。")
+                    Text("导入挥杆视频或图片，在球经过的位置标记关键点，自动生成平滑的飞行曲线。")
                         .foregroundStyle(.secondary)
                 }
 
                 VStack(spacing: 12) {
                     CameraRecorderButton { url in
-                        session.ingestVideo(from: url)
+                        session.importVideo(from: url)
                     }
 
-                    PhotosPicker(selection: $pickedItem, matching: .videos, photoLibrary: .shared()) {
-                        Label("从相册选择", systemImage: "photo.on.rectangle")
+                    PhotosPicker(selection: $pickedVideo, matching: .videos, photoLibrary: .shared()) {
+                        Label("从相册选择视频", systemImage: "video.fill")
                             .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                            .frame(maxWidth: .infinity, minHeight: 52)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    }
+
+                    PhotosPicker(selection: $pickedImage, matching: .images, photoLibrary: .shared()) {
+                        Label("从相册选择图片", systemImage: "photo.on.rectangle")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, minHeight: 52)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
                     }
                 }
 
@@ -68,10 +83,10 @@ struct HomeView: View {
                                 session.open(shot)
                             } label: {
                                 HStack {
-                                    Image(systemName: shot.trace.points.isEmpty ? "circle.slash" : "point.topleft.down.to.point.bottomright.curvepath")
+                                    Image(systemName: shot.mediaType == .image ? "photo" : "video")
                                     VStack(alignment: .leading) {
                                         Text(shot.displayTitle)
-                                        Text(shot.trace.points.isEmpty ? "无线路" : "\(shot.trace.points.count) 个点")
+                                        Text(shot.trace.points.isEmpty ? "无轨迹" : "\(shot.trace.points.count) 个关键点")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
@@ -97,33 +112,43 @@ struct HomeView: View {
             .padding()
         }
         .navigationTitle("GolfTrace")
-    }
-
-    private var processingOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.35).ignoresSafeArea()
-            VStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.large)
-                Text(session.processingMessage)
-                    .font(.headline)
-            }
-            .padding(28)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(alignment: .bottom) {
+            // 底部渐进模糊：从上透明渐入到模糊，不拦截触摸
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .frame(height: 120)
+                .mask {
+                    LinearGradient(
+                        colors: [.clear, .white],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .allowsHitTesting(false)
+                .ignoresSafeArea(edges: .bottom)
         }
     }
 
-    private func importPickedVideo(_ item: PhotosPickerItem) async {
+    private func importPicked(_ item: PhotosPickerItem, as type: MediaType) async {
         do {
-            guard let movie = try await item.loadTransferable(type: ImportedMovie.self) else {
-                session.errorMessage = "无法读取这段视频"
-                return
+            switch type {
+            case .video:
+                guard let movie = try await item.loadTransferable(type: ImportedMovie.self) else {
+                    session.errorMessage = "无法读取这段视频"
+                    return
+                }
+                session.importVideo(from: movie.url)
+            case .image:
+                guard let image = try await item.loadTransferable(type: ImportedImage.self) else {
+                    session.errorMessage = "无法读取这张图片"
+                    return
+                }
+                session.importImage(from: image.url)
             }
-            session.ingestVideo(from: movie.url)
         } catch {
             session.errorMessage = error.localizedDescription
         }
-        pickedItem = nil
+        if type == .video { pickedVideo = nil } else { pickedImage = nil }
     }
 }
 
@@ -145,6 +170,28 @@ struct ImportedMovie: Transferable {
                 .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
             try FileManager.default.copyItem(at: received.file, to: destination)
             return ImportedMovie(url: destination)
+        }
+    }
+}
+
+struct ImportedImage: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .image) { image in
+            SentTransferredFile(image.url)
+        } importing: { received in
+            let accessed = received.file.startAccessingSecurityScopedResource()
+            defer {
+                if accessed {
+                    received.file.stopAccessingSecurityScopedResource()
+                }
+            }
+            let ext = received.file.pathExtension.isEmpty ? "jpg" : received.file.pathExtension
+            let destination = FileManager.default.temporaryDirectory
+                .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
+            try FileManager.default.copyItem(at: received.file, to: destination)
+            return ImportedImage(url: destination)
         }
     }
 }

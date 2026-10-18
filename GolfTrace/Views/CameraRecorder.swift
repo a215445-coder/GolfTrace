@@ -17,10 +17,9 @@ struct CameraRecorderButton: View {
         } label: {
             Label("拍摄视频", systemImage: "video.fill")
                 .font(.headline)
-                .frame(maxWidth: .infinity)
-                .padding()
+                .frame(maxWidth: .infinity, minHeight: 52)
                 .foregroundStyle(.white)
-                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 16))
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14))
         }
         .sheet(isPresented: $isPresented) {
             CameraRecorder(onRecorded: onRecorded)
