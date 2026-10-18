@@ -10,6 +10,16 @@ struct TraceStyle {
     var bendLeft: Double
     var bendRight: Double
     var paceDeceleration: Double
+    var showDistance: Bool
+    var targetDistance: Double
+}
+
+/// 弯曲编辑手柄：外侧轨迹线上的两个可拖动圆点
+enum BendHandleKind {
+    /// 顶点手柄：上下拖动调整轨迹高度
+    case height
+    /// 侧弯手柄：左右拖动调整轨迹左右幅度
+    case lateral
 }
 
 struct ReviewView: View {
@@ -41,12 +51,35 @@ struct ReviewView: View {
     @State private var pendingAction: PendingAction?
     /// 轨迹几何缓存（归一化坐标）：仅随关键点/弯曲变化重算，播放逐帧只做截取与映射
     @State private var cachedGeometry: CachedGeometry?
+    /// 正在拖拽的弯曲手柄（按下时锚定基准，保证跟手且无跳变）
+    @State private var bendDrag: BendDragState?
 
     private struct CachedGeometry {
         let points: [TracePoint]
         let bendLeft: Double
         let bendRight: Double
+        let bendHeight: Double
         let geometry: TrajectoryGeometry
+        /// 未弯曲的基准轨迹：弯曲编辑模式的内层参考线
+        let baseGeometry: TrajectoryGeometry
+    }
+
+    /// 弯曲手柄拖拽状态
+    private struct BendDragState {
+        let kind: BendHandleKind
+        /// 顶点在高度为 0 时的视图 y（按下时锁定）
+        let baseApexY: CGFloat
+        /// 顶点随 bendHeight 每单位上移的像素数（按下时锁定）
+        let heightPxPerUnit: CGFloat
+        /// 按下时的侧弯强度 g（-1…1，0.8 次幂后的值）
+        let startStrength: Double
+        /// 满强度侧弯在锚定采样点处的水平偏移（像素，带方向）
+        let dMaxPx: CGFloat
+        /// 按下位置：侧弯手柄以相对位移驱动
+        let startLocation: CGPoint
+        /// 按下时锁定的手柄采样下标（拖拽中手柄不跳变）
+        let anchorApexIndex: Int
+        let anchorLateralIndex: Int
     }
 
     /// 取轨迹几何：命中缓存直接复用，避免每帧重复计算曲线
@@ -55,21 +88,37 @@ struct ReviewView: View {
         if let cached = cachedGeometry,
            cached.points == points,
            cached.bendLeft == shot.trace.bendLeft,
-           cached.bendRight == shot.trace.bendRight {
+           cached.bendRight == shot.trace.bendRight,
+           cached.bendHeight == shot.trace.bendHeight {
             return cached.geometry
         }
         let geometry = VideoGeometry.trajectoryGeometry(
             keyPoints: points.map(\.location),
             bendLeft: shot.trace.bendLeft,
-            bendRight: shot.trace.bendRight
+            bendRight: shot.trace.bendRight,
+            bendHeight: shot.trace.bendHeight
+        )
+        let baseGeometry = VideoGeometry.trajectoryGeometry(
+            keyPoints: points.map(\.location),
+            bendLeft: 0,
+            bendRight: 0
         )
         cachedGeometry = CachedGeometry(
             points: points,
             bendLeft: shot.trace.bendLeft,
             bendRight: shot.trace.bendRight,
-            geometry: geometry
+            bendHeight: shot.trace.bendHeight,
+            geometry: geometry,
+            baseGeometry: baseGeometry
         )
         return geometry
+    }
+
+    /// 取未弯曲的基准轨迹几何（弯曲编辑模式的内层参考线）
+    private func baseTraceGeometry(for shot: ShotRecord) -> TrajectoryGeometry {
+        _ = traceGeometry(for: shot)
+        return cachedGeometry?.baseGeometry
+            ?? TrajectoryGeometry(samples: [], cumulativeLengths: [], keyCumulativeLengths: [])
     }
 
     private let hitRadius: CGFloat = 28
@@ -77,7 +126,7 @@ struct ReviewView: View {
     private static let presetColors: [Color] = [.white, .yellow, .orange, .red, .green, .blue]
 
     enum EditorTool: String, CaseIterable, Identifiable {
-        case lineWidth, bend, color, opacity
+        case lineWidth, bend, color, opacity, distance
         var id: String { rawValue }
         var title: String {
             switch self {
@@ -85,6 +134,7 @@ struct ReviewView: View {
             case .bend: return "弯曲"
             case .color: return "颜色"
             case .opacity: return "透明度"
+            case .distance: return "距离"
             }
         }
         var icon: String {
@@ -93,6 +143,7 @@ struct ReviewView: View {
             case .bend: return "point.topleft.down.to.point.bottomright.curvepath"
             case .color: return "paintpalette"
             case .opacity: return "circle.lefthalf.filled"
+            case .distance: return "ruler"
             }
         }
     }
@@ -126,13 +177,7 @@ struct ReviewView: View {
             }
         }
         .background(Color.black)
-        .navigationTitle("轨迹")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                BackButton { session.goHome() }
-            }
-        }
+        .toolbar(.hidden, for: .navigationBar)
         .onAppear { loadShot() }
         .onDisappear {
             session.saveCurrentShot()
@@ -167,7 +212,10 @@ struct ReviewView: View {
         let geometry = traceGeometry(for: shot)
         let sortedPoints = shot.trace.sortedPoints
         let overlayStyle = style(for: shot)
-        let isVideoPlaying = shot.mediaType == .video && !isEditing
+        // 弯曲编辑时暂停动画并显示完整曲线（起点到终点的整条轨迹）
+        let isVideoPlaying = shot.mediaType == .video && !isEditing && activeTool != .bend
+        let bendEditActive = activeTool == .bend
+        let baseGeometry = bendEditActive ? baseTraceGeometry(for: shot) : nil
         return GeometryReader { proxy in
             let videoSize = CGSize(
                 width: max(shot.trace.videoWidth, 1),
@@ -197,8 +245,17 @@ struct ReviewView: View {
                         videoRect: videoRect,
                         style: overlayStyle,
                         selectedID: isEditing ? selectedPointID : nil,
-                        showHandles: isEditing
+                        showHandles: isEditing,
+                        baseGeometry: baseGeometry,
+                        bendHandles: bendEditActive ? bendHandlePoints(videoRect: videoRect) : nil,
+                        activeBendHandle: bendDrag?.kind
                     )
+                }
+                // 弯曲编辑模式（未进入关键点编辑时）：拖动外侧轨迹线上的两个圆点
+                if bendEditActive, !isEditing {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .gesture(bendGesture(videoRect: videoRect))
                 }
                 if isEditing {
                     Color.clear
@@ -218,14 +275,14 @@ struct ReviewView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
                 .background(.ultraThinMaterial, in: Capsule())
-                .padding(.top, 8)
+                .padding(.top, 56)
         } else if shot.trace.points.isEmpty {
             Text("点「编辑轨迹」在球经过的位置标记关键点")
                 .font(.caption)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
                 .background(.ultraThinMaterial, in: Capsule())
-                .padding(.top, 8)
+                .padding(.top, 56)
         }
     }
 
@@ -236,7 +293,9 @@ struct ReviewView: View {
             opacity: shot.trace.opacity,
             bendLeft: shot.trace.bendLeft,
             bendRight: shot.trace.bendRight,
-            paceDeceleration: shot.trace.paceDeceleration
+            paceDeceleration: shot.trace.paceDeceleration,
+            showDistance: shot.trace.showDistance,
+            targetDistance: shot.trace.targetDistance
         )
     }
 
@@ -245,14 +304,14 @@ struct ReviewView: View {
     @ViewBuilder
     private func timelineSection(_ shot: ShotRecord) -> some View {
         if shot.mediaType == .video {
-            VStack(spacing: 6) {
-                HStack(spacing: 8) {
+            VStack(spacing: 4) {
+                HStack(spacing: 6) {
                     Button {
                         togglePlay()
                     } label: {
                         Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                             .font(.system(size: 15, weight: .medium))
-                            .frame(width: 36, height: 32)
+                            .frame(width: 34, height: 26)
                             .contentShape(Rectangle())
                     }
                     Button {
@@ -260,7 +319,7 @@ struct ReviewView: View {
                     } label: {
                         Image(systemName: "backward.frame.fill")
                             .font(.system(size: 15, weight: .medium))
-                            .frame(width: 36, height: 32)
+                            .frame(width: 34, height: 26)
                             .contentShape(Rectangle())
                     }
                     Button {
@@ -268,7 +327,7 @@ struct ReviewView: View {
                     } label: {
                         Image(systemName: "forward.frame.fill")
                             .font(.system(size: 15, weight: .medium))
-                            .frame(width: 36, height: 32)
+                            .frame(width: 34, height: 26)
                             .contentShape(Rectangle())
                     }
                     Spacer()
@@ -320,14 +379,14 @@ struct ReviewView: View {
                         Image(uiImage: filmstrip[index].image)
                             .resizable()
                             .scaledToFill()
-                            .frame(width: slotWidth, height: 40)
+                            .frame(width: slotWidth, height: 32)
                             .clipped()
                     }
                 }
                 // 播放头
                 Rectangle()
                     .fill(Color.accentColor)
-                    .frame(width: 2, height: 40)
+                    .frame(width: 2, height: 32)
                     .offset(x: min(max(progress * width, 0), width - 2))
             }
             .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -349,7 +408,7 @@ struct ReviewView: View {
                     }
             )
         }
-        .frame(height: 40)
+        .frame(height: 32)
     }
 
     private var timeLabel: String {
@@ -372,6 +431,10 @@ struct ReviewView: View {
             player.pause()
             isPlaying = false
         } else {
+            // 已播放到结尾：从头重新播放
+            if duration > 1, currentTime >= duration - 0.05 {
+                seek(to: 0)
+            }
             player.play()
             isPlaying = true
         }
@@ -398,7 +461,9 @@ struct ReviewView: View {
 
     private func toolRow(_ shot: ShotRecord) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                toolButton(icon: "chevron.left", title: "返回") { session.goHome() }
+
                 toolButton(
                     icon: isEditing ? "checkmark.circle.fill" : "hand.draw.fill",
                     title: isEditing ? "完成" : "编辑轨迹",
@@ -411,6 +476,11 @@ struct ReviewView: View {
 
                 ForEach(EditorTool.allCases) { tool in
                     toolButton(icon: tool.icon, title: tool.title, active: activeTool == tool) {
+                        // 打开弯曲面板时暂停播放、显示完整轨迹，便于整条曲线调形
+                        if tool == .bend, activeTool != .bend {
+                            player.pause()
+                            isPlaying = false
+                        }
                         withAnimation(.easeInOut(duration: 0.18)) {
                             activeTool = activeTool == tool ? nil : tool
                         }
@@ -433,7 +503,7 @@ struct ReviewView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
         }
         .background(ToolbarPalette.background)
         .overlay(alignment: .top) {
@@ -468,7 +538,7 @@ struct ReviewView: View {
                 .lineLimit(1)
         }
         .foregroundStyle(active ? Color.accentColor : (destructive ? ToolbarPalette.destructive : ToolbarPalette.unselected))
-        .frame(width: 56, height: 46)
+        .frame(width: 52, height: 40)
         .background(
             active ? ToolbarPalette.activeBackground : ToolbarPalette.buttonBackground,
             in: RoundedRectangle(cornerRadius: 12)
@@ -499,10 +569,15 @@ struct ReviewView: View {
                 case .opacity:
                     styleSlider("透明度", value: traceBinding(\.opacity), range: 0.15...1)
                 case .bend:
-                    styleSlider("左弯", value: traceBinding(\.bendLeft), range: 0...1)
-                    styleSlider("右弯", value: traceBinding(\.bendRight), range: 0...1)
+                    Text("拖动外侧轨迹线上的圆点，调整轨迹的高度和左右幅度")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 case .color:
                     colorRow(shot)
+                case .distance:
+                    Toggle("显示距离数字", isOn: distanceToggleBinding)
+                        .font(.system(size: 14))
+                    styleSlider("目标距离(yd)", value: traceBinding(\.targetDistance), range: 0...500)
                 }
             }
             .padding(12)
@@ -556,11 +631,39 @@ struct ReviewView: View {
         }
     }
 
-    // MARK: - 手势：点击加点 / 拖拽移动 / 点选
+    // MARK: - 手势：点击加点 / 拖拽移动 / 点选 / 弯曲手柄
+
+    /// 弯曲模式专用手势（未进入关键点编辑时）：只响应弯曲手柄拖拽
+    private func bendGesture(videoRect: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+            .onChanged { value in
+                if bendDrag == nil {
+                    guard let kind = hitTestBendHandle(value.startLocation, videoRect: videoRect) else { return }
+                    beginBendDrag(kind: kind, at: value.startLocation, videoRect: videoRect)
+                }
+                updateBendDrag(to: value.location)
+            }
+            .onEnded { value in
+                if bendDrag != nil {
+                    updateBendDrag(to: value.location)
+                    session.saveCurrentShot()
+                    bendDrag = nil
+                }
+            }
+    }
 
     private func editGesture(videoRect: CGRect) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
             .onChanged { value in
+                // 弯曲模式优先：按下命中弯曲手柄 → 拖拽手柄调整高度/左右幅度
+                if activeTool == .bend, bendDrag == nil,
+                   let kind = hitTestBendHandle(value.startLocation, videoRect: videoRect) {
+                    beginBendDrag(kind: kind, at: value.startLocation, videoRect: videoRect)
+                }
+                if bendDrag != nil {
+                    updateBendDrag(to: value.location)
+                    return
+                }
                 // 按下瞬间做命中检测：命中关键点 → 选中并进入拖拽；否则等待松手判定为加点
                 if draggedPointID == nil {
                     if let hit = hitTest(value.startLocation, videoRect: videoRect) {
@@ -574,7 +677,11 @@ struct ReviewView: View {
                 }
             }
             .onEnded { value in
-                if let id = draggedPointID {
+                if bendDrag != nil {
+                    updateBendDrag(to: value.location)
+                    session.saveCurrentShot()
+                    bendDrag = nil
+                } else if let id = draggedPointID {
                     movePoint(id: id, to: value.location, videoRect: videoRect)
                     session.saveCurrentShot()
                     draggedPointID = nil
@@ -602,6 +709,90 @@ struct ReviewView: View {
             }
         }
         return best?.id
+    }
+
+    /// 弯曲手柄的触控半径（比关键点更大，方便在曲线上抓取）
+    private let bendHandleHitRadius: CGFloat = 34
+
+    /// 外侧轨迹线上两个弯曲手柄的视图坐标
+    private func bendHandlePoints(videoRect: CGRect) -> (height: CGPoint, lateral: CGPoint)? {
+        guard let shot = session.currentShot, shot.trace.points.count >= 2 else { return nil }
+        let geometry = traceGeometry(for: shot)
+        let base = baseTraceGeometry(for: shot)
+        guard let indices = VideoGeometry.bendHandleIndices(geometry: geometry, base: base) else { return nil }
+        let apexIndex = bendDrag?.kind == .height ? bendDrag!.anchorApexIndex : indices.apex
+        let lateralIndex = bendDrag?.kind == .lateral ? bendDrag!.anchorLateralIndex : indices.lateral
+        func map(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: videoRect.minX + point.x * videoRect.width,
+                    y: videoRect.minY + point.y * videoRect.height)
+        }
+        return (map(geometry.samples[apexIndex]), map(geometry.samples[lateralIndex]))
+    }
+
+    private func hitTestBendHandle(_ location: CGPoint, videoRect: CGRect) -> BendHandleKind? {
+        guard activeTool == .bend, let handles = bendHandlePoints(videoRect: videoRect) else { return nil }
+        let dHeight = hypot(handles.height.x - location.x, handles.height.y - location.y)
+        let dLateral = hypot(handles.lateral.x - location.x, handles.lateral.y - location.y)
+        guard min(dHeight, dLateral) <= bendHandleHitRadius else { return nil }
+        return dHeight <= dLateral ? .height : .lateral
+    }
+
+    /// 按下弯曲手柄：锚定顶点高度/侧弯强度等基准，保证拖拽跟手且无跳变
+    private func beginBendDrag(kind: BendHandleKind, at location: CGPoint, videoRect: CGRect) {
+        guard let shot = session.currentShot, shot.trace.points.count >= 2 else { return }
+        let geometry = traceGeometry(for: shot)
+        let base = baseTraceGeometry(for: shot)
+        guard let indices = VideoGeometry.bendHandleIndices(geometry: geometry, base: base),
+              let frame = VideoGeometry.bendFrame(samples: base.samples) else { return }
+        // 高度为 0 时的顶点 y；顶点随 bendHeight 每单位沿屏幕竖直上移 = 顶点离弦高度（像素）
+        // 轨迹近似直线时退化为画面高度（sin² 包络在顶点处为 1）
+        let baseApexY = videoRect.minY + base.samples[indices.apex].y * videoRect.height
+        let heightPxPerUnit: CGFloat
+        if frame.apexHeight > 0.0001 {
+            heightPxPerUnit = max(CGFloat(Double(videoRect.height) * frame.apexHeight), 1)
+        } else {
+            heightPxPerUnit = videoRect.height
+        }
+        // 当前侧弯强度 g（0.8 次幂后的值，-1…1）
+        let b = shot.trace.bendRight - shot.trace.bendLeft
+        let startStrength = b >= 0 ? pow(b, 0.8) : -pow(-b, 0.8)
+        // 满强度侧弯探针：锚定采样点的水平偏移（带方向），作为拖拽换算基准
+        let probe = VideoGeometry.trajectoryGeometry(
+            keyPoints: shot.trace.sortedPoints.map(\.location),
+            bendLeft: 0,
+            bendRight: 1
+        )
+        var dMaxPx = (probe.samples[indices.lateral].x - base.samples[indices.lateral].x) * videoRect.width
+        if abs(dMaxPx) < 1 {
+            dMaxPx = dMaxPx >= 0 ? 1 : -1
+        }
+        bendDrag = BendDragState(
+            kind: kind,
+            baseApexY: baseApexY,
+            heightPxPerUnit: heightPxPerUnit,
+            startStrength: startStrength,
+            dMaxPx: dMaxPx,
+            startLocation: location,
+            anchorApexIndex: indices.apex,
+            anchorLateralIndex: indices.lateral
+        )
+    }
+
+    /// 拖拽中更新弯曲参数：高度手柄写 bendHeight，侧弯手柄写 bendLeft/bendRight
+    private func updateBendDrag(to location: CGPoint) {
+        guard var shot = session.currentShot, let drag = bendDrag else { return }
+        switch drag.kind {
+        case .height:
+            let height = Double(drag.baseApexY - location.y) / Double(drag.heightPxPerUnit)
+            shot.trace.bendHeight = min(max(height, -0.5), 0.5)
+        case .lateral:
+            let dx = location.x - drag.startLocation.x
+            let strength = min(max(drag.startStrength + Double(dx) / Double(drag.dMaxPx), -1), 1)
+            let b = strength >= 0 ? pow(strength, 1.25) : -pow(-strength, 1.25)
+            shot.trace.bendRight = max(b, 0)
+            shot.trace.bendLeft = max(-b, 0)
+        }
+        session.currentShot = shot
     }
 
     private func addPoint(at location: CGPoint, videoRect: CGRect) {
@@ -706,6 +897,18 @@ struct ReviewView: View {
         )
     }
 
+    private var distanceToggleBinding: Binding<Bool> {
+        Binding(
+            get: { session.currentShot?.trace.showDistance ?? false },
+            set: { newValue in
+                guard var shot = session.currentShot else { return }
+                shot.trace.showDistance = newValue
+                session.currentShot = shot
+                session.saveCurrentShot()
+            }
+        )
+    }
+
     private var colorBinding: Binding<Color> {
         Binding(
             get: {
@@ -760,6 +963,7 @@ struct ReviewView: View {
         redoStack.removeAll()
         selectedPointID = nil
         draggedPointID = nil
+        bendDrag = nil
         activeTool = nil
         isEditing = false
         currentTime = 0
@@ -801,6 +1005,10 @@ struct ReviewView: View {
         let interval = CMTime(value: 1, timescale: 60)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
             currentTime = time.seconds
+            // 视频播放到结尾：按钮恢复为「播放」状态
+            if isPlaying, duration > 1, currentTime >= duration - 0.03 {
+                isPlaying = false
+            }
         }
         Task {
             if let durationTime = try? await item.asset.load(.duration) {
@@ -869,38 +1077,6 @@ struct ToolPressStyle: ButtonStyle {
     }
 }
 
-/// 左上角返回按钮：横向深黑胶囊，内部仅一个电光蓝左箭头。
-/// 极简冷峻，与黑色编辑界面融为一体。
-struct BackButton: View {
-    var action: () -> Void
-
-    /// 电光蓝箭头强调色
-    private let arrowColor = Color(red: 0.25, green: 0.66, blue: 1.0)
-
-    var body: some View {
-        Button(action: action) {
-            // 唯一一层背景：深黑胶囊底板；箭头直接置于其上，无描边、无阴影、无叠加层
-            Image(systemName: "chevron.backward")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(arrowColor)
-                .frame(width: 60, height: 36)
-                .background(Color.black.opacity(0.55), in: Capsule())
-                .contentShape(Capsule())
-        }
-        .buttonStyle(BackButtonPressStyle())
-    }
-}
-
-/// 返回按钮按压反馈：轻微缩小 + 背景微亮，松开平滑恢复
-struct BackButtonPressStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.92 : 1)
-            .brightness(configuration.isPressed ? 0.12 : 0)
-            .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
-    }
-}
-
 struct PlayerLayerView: UIViewRepresentable {
     let player: AVPlayer
 
@@ -934,6 +1110,12 @@ struct TraceOverlay: View {
     let style: TraceStyle
     let selectedID: UUID?
     let showHandles: Bool
+    /// 弯曲编辑模式：未弯曲的基准轨迹（内层虚线参考线），nil = 不显示
+    let baseGeometry: TrajectoryGeometry?
+    /// 外侧轨迹线上的两个弯曲手柄（↕ 高度 · ↔ 左右），nil = 非弯曲模式
+    let bendHandles: (height: CGPoint, lateral: CGPoint)?
+    /// 正在拖拽的弯曲手柄（高亮显示）
+    let activeBendHandle: BendHandleKind?
 
     /// 按分数采样位置截取并映射到视图坐标；末端在相邻采样点之间线性插值，
     /// 保证轨迹末端每帧连续移动、慢速阶段无顿挫。
@@ -968,10 +1150,33 @@ struct TraceOverlay: View {
 
     var body: some View {
         Canvas { context, _ in
+            // 弯曲编辑：内层基准线（未弯曲轨迹，虚线参考）
+            if let baseGeometry, bendHandles != nil, baseGeometry.samples.count >= 2 {
+                let basePoints = baseGeometry.samples.map {
+                    CGPoint(x: videoRect.minX + $0.x * videoRect.width,
+                            y: videoRect.minY + $0.y * videoRect.height)
+                }
+                var basePath = Path()
+                basePath.move(to: basePoints[0])
+                for segment in VideoGeometry.bezierSegments(basePoints) {
+                    basePath.addCurve(to: segment.end, control1: segment.control1, control2: segment.control2)
+                }
+                context.stroke(
+                    basePath,
+                    with: .color(.white.opacity(0.38)),
+                    style: StrokeStyle(
+                        lineWidth: max(style.lineWidth * 0.85, 1),
+                        lineCap: .round,
+                        lineJoin: .round,
+                        dash: [6, 8]
+                    )
+                )
+            }
             // 曲线绘制：逐帧仅做「弧长截取 + 坐标映射 + 路径构建」，几何零重算
             if geometry.samples.count >= 2 {
                 var pathPoints: [CGPoint] = []
                 var drawAll = true
+                var progress = 1.0
                 if let clipTime {
                     if let count = VideoGeometry.drawSampleCount(
                         geometry: geometry,
@@ -983,6 +1188,7 @@ struct TraceOverlay: View {
                         guard count > 0 else { return }
                         drawAll = false
                         pathPoints = mappedPathPoints(count: count)
+                        progress = min(max(count / Double(max(geometry.samples.count - 1, 1)), 0), 1)
                     }
                 }
                 if drawAll {
@@ -990,6 +1196,7 @@ struct TraceOverlay: View {
                         CGPoint(x: videoRect.minX + $0.x * videoRect.width,
                                 y: videoRect.minY + $0.y * videoRect.height)
                     }
+                    progress = 1
                 }
                 if pathPoints.count >= 2 {
                     var path = Path()
@@ -1026,6 +1233,25 @@ struct TraceOverlay: View {
                     let dot = Path(ellipseIn: CGRect(x: last.x - 5, y: last.y - 5, width: 10, height: 10))
                     context.fill(dot, with: .color(.orange))
                 }
+                // 距离数字：随轨迹延伸从 0 逐渐涨到用户设定的目标值
+                if style.showDistance, let last = pathPoints.last {
+                    let distance = style.targetDistance * progress
+                    let label = Text(String(format: "%.0f yd", distance))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                    let resolved = context.resolve(label)
+                    let textSize = resolved.measure(in: CGSize(width: 240, height: 40))
+                    let origin = CGPoint(
+                        x: min(max(last.x + 12, videoRect.minX + 4), videoRect.maxX - textSize.width - 16),
+                        y: max(last.y - textSize.height - 16, videoRect.minY + 4)
+                    )
+                    let capsule = CGRect(
+                        x: origin.x - 7, y: origin.y - 3,
+                        width: textSize.width + 14, height: textSize.height + 6
+                    )
+                    context.fill(Path(roundedRect: capsule, cornerRadius: 10), with: .color(.black.opacity(0.55)))
+                    context.draw(label, at: origin, anchor: .topLeading)
+                }
             }
 
             // 编辑模式：关键点手柄（视觉小圆点，触控区域由 ReviewView 的 hitRadius 保证）
@@ -1051,7 +1277,21 @@ struct TraceOverlay: View {
                     )
                 }
             }
+
+            // 弯曲编辑：外侧轨迹线上的两个拖拽手柄（图标一致）
+            if let bendHandles {
+                drawBendHandle(in: &context, at: bendHandles.height, active: activeBendHandle == .height)
+                drawBendHandle(in: &context, at: bendHandles.lateral, active: activeBendHandle == .lateral)
+            }
         }
         .allowsHitTesting(false)
+    }
+
+    /// 弯曲手柄：白色圆点 + 橙色描边，两个手柄外观一致
+    private func drawBendHandle(in context: inout GraphicsContext, at point: CGPoint, active: Bool) {
+        let radius: CGFloat = active ? 8 : 7
+        let rect = CGRect(x: point.x - radius, y: point.y - radius, width: radius * 2, height: radius * 2)
+        context.fill(Path(ellipseIn: rect), with: .color(.white))
+        context.stroke(Path(ellipseIn: rect), with: .color(.orange), lineWidth: active ? 2.5 : 1.5)
     }
 }

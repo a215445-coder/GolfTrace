@@ -5,7 +5,6 @@ import UniformTypeIdentifiers
 struct HomeView: View {
     @EnvironmentObject private var session: AppSession
     @State private var pickedVideo: PhotosPickerItem?
-    @State private var pickedImage: PhotosPickerItem?
 
     var body: some View {
         NavigationStack {
@@ -27,11 +26,7 @@ struct HomeView: View {
         }
         .onChange(of: pickedVideo) { _, item in
             guard let item else { return }
-            Task { await importPicked(item, as: .video) }
-        }
-        .onChange(of: pickedImage) { _, item in
-            guard let item else { return }
-            Task { await importPicked(item, as: .image) }
+            Task { await importPicked(item) }
         }
         .onAppear {
 #if DEBUG
@@ -50,7 +45,7 @@ struct HomeView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("记录球的飞行轨迹")
                         .font(.largeTitle.bold())
-                    Text("导入挥杆视频或图片，在球经过的位置标记关键点，自动生成平滑的飞行曲线。")
+                    Text("导入挥杆视频，在球经过的位置标记关键点，自动生成平滑的飞行曲线。")
                         .foregroundStyle(.secondary)
                 }
 
@@ -61,13 +56,6 @@ struct HomeView: View {
 
                     PhotosPicker(selection: $pickedVideo, matching: .videos, photoLibrary: .shared()) {
                         Label("从相册选择视频", systemImage: "video.fill")
-                            .font(.headline)
-                            .frame(maxWidth: .infinity, minHeight: 52)
-                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                    }
-
-                    PhotosPicker(selection: $pickedImage, matching: .images, photoLibrary: .shared()) {
-                        Label("从相册选择图片", systemImage: "photo.on.rectangle")
                             .font(.headline)
                             .frame(maxWidth: .infinity, minHeight: 52)
                             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -129,26 +117,17 @@ struct HomeView: View {
         }
     }
 
-    private func importPicked(_ item: PhotosPickerItem, as type: MediaType) async {
+    private func importPicked(_ item: PhotosPickerItem) async {
         do {
-            switch type {
-            case .video:
-                guard let movie = try await item.loadTransferable(type: ImportedMovie.self) else {
-                    session.errorMessage = "无法读取这段视频"
-                    return
-                }
-                session.importVideo(from: movie.url)
-            case .image:
-                guard let image = try await item.loadTransferable(type: ImportedImage.self) else {
-                    session.errorMessage = "无法读取这张图片"
-                    return
-                }
-                session.importImage(from: image.url)
+            guard let movie = try await item.loadTransferable(type: ImportedMovie.self) else {
+                session.errorMessage = "无法读取这段视频"
+                return
             }
+            session.importVideo(from: movie.url)
         } catch {
             session.errorMessage = error.localizedDescription
         }
-        if type == .video { pickedVideo = nil } else { pickedImage = nil }
+        pickedVideo = nil
     }
 }
 
@@ -170,28 +149,6 @@ struct ImportedMovie: Transferable {
                 .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
             try FileManager.default.copyItem(at: received.file, to: destination)
             return ImportedMovie(url: destination)
-        }
-    }
-}
-
-struct ImportedImage: Transferable {
-    let url: URL
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(contentType: .image) { image in
-            SentTransferredFile(image.url)
-        } importing: { received in
-            let accessed = received.file.startAccessingSecurityScopedResource()
-            defer {
-                if accessed {
-                    received.file.stopAccessingSecurityScopedResource()
-                }
-            }
-            let ext = received.file.pathExtension.isEmpty ? "jpg" : received.file.pathExtension
-            let destination = FileManager.default.temporaryDirectory
-                .appendingPathComponent("import-\(UUID().uuidString).\(ext)")
-            try FileManager.default.copyItem(at: received.file, to: destination)
-            return ImportedImage(url: destination)
         }
     }
 }

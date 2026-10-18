@@ -35,7 +35,8 @@ final class VideoExporter: @unchecked Sendable {
         let geometry = VideoGeometry.trajectoryGeometry(
             keyPoints: shot.trace.sortedPoints.map(\.location),
             bendLeft: shot.trace.bendLeft,
-            bendRight: shot.trace.bendRight
+            bendRight: shot.trace.bendRight,
+            bendHeight: shot.trace.bendHeight
         )
         let rendered = renderer.image { ctx in
             image.draw(in: CGRect(origin: .zero, size: size))
@@ -94,7 +95,8 @@ final class VideoExporter: @unchecked Sendable {
         let geometry = VideoGeometry.trajectoryGeometry(
             keyPoints: shot.trace.sortedPoints.map(\.location),
             bendLeft: shot.trace.bendLeft,
-            bendRight: shot.trace.bendRight
+            bendRight: shot.trace.bendRight,
+            bendHeight: shot.trace.bendHeight
         )
         // CIContext 全程复用：逐帧创建 GPU 上下文会拖慢导出并在真机上耗尽资源
         let ciContext = CIContext(options: [.useSoftwareRenderer: false])
@@ -248,6 +250,7 @@ final class VideoExporter: @unchecked Sendable {
         guard points.count >= 2 else { return }
         var pathPoints: [CGPoint] = []
         var drawAll = true
+        var progress = 1.0
         if let clipTime {
             if let count = VideoGeometry.drawSampleCount(
                 geometry: geometry,
@@ -258,6 +261,7 @@ final class VideoExporter: @unchecked Sendable {
             ) {
                 guard count > 0 else { return }
                 drawAll = false
+                progress = min(max(count / Double(max(geometry.samples.count - 1, 1)), 0), 1)
                 let samples = geometry.samples
                 let whole = min(Int(count.rounded(.down)), samples.count)
                 pathPoints = samples.prefix(whole).map {
@@ -345,6 +349,29 @@ final class VideoExporter: @unchecked Sendable {
             )
             UIColor(red: 1, green: 0.27, blue: 0, alpha: 1).setFill()
             dot.fill()
+        }
+
+        // 距离数字：随轨迹延伸从 0 逐渐涨到用户设定的目标值
+        if shot.trace.showDistance, let last = pathPoints.last {
+            let distance = shot.trace.targetDistance * progress
+            let text = String(format: "%.0f yd", distance)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: UIColor.white
+            ]
+            let string = NSAttributedString(string: text, attributes: attributes)
+            let textSize = string.size()
+            let origin = CGPoint(
+                x: min(max(last.x + 12, 4), size.width - textSize.width - 16),
+                y: max(last.y - textSize.height - 16, 4)
+            )
+            let capsule = CGRect(
+                x: origin.x - 7, y: origin.y - 3,
+                width: textSize.width + 14, height: textSize.height + 6
+            )
+            UIColor.black.withAlphaComponent(0.55).setFill()
+            UIBezierPath(roundedRect: capsule, cornerRadius: 10).fill()
+            string.draw(at: origin)
         }
     }
 

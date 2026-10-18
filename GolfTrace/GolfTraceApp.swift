@@ -1,25 +1,24 @@
 import AVFoundation
-import GoogleSignIn
 import SwiftUI
 
 @main
 struct GolfTraceApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var session = AppSession()
 
     var body: some Scene {
         WindowGroup {
-            Group {
+            ZStack {
                 if session.route == .login {
                     LoginView()
+                        .transition(.asymmetric(insertion: .identity, removal: .loginZoomOut))
                 } else {
                     HomeView()
+                        .transition(.homeZoomIn)
                 }
             }
             .environmentObject(session)
-            .onOpenURL { url in
-                // Google 授权完成后通过回调 URL Scheme 跳回 App
-                GIDSignIn.sharedInstance.handle(url)
-            }
+            .animation(.spring(response: 0.5, dampingFraction: 0.85), value: session.route)
         }
     }
 }
@@ -30,8 +29,6 @@ final class AppSession: ObservableObject {
     @Published var currentShot: ShotRecord?
     @Published var errorMessage: String?
     @Published var library: [ShotRecord] = []
-    /// Google 登录认证后的用户信息（来自 Google 官方 SDK）
-    @Published var googleUser: GoogleUserProfile?
 
     private let store = ShotLibrary()
 
@@ -74,20 +71,6 @@ final class AppSession: ObservableObject {
         }
     }
 
-    func importImage(from sourceURL: URL) {
-        Task {
-            do {
-                let stored = try store.importImage(from: sourceURL)
-                try store.save(stored)
-                currentShot = stored
-                library = store.loadIndex()
-                route = .review
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
-
     func saveCurrentShot() {
         guard let currentShot else { return }
         try? store.save(currentShot)
@@ -111,5 +94,57 @@ final class AppSession: ObservableObject {
         if currentShot?.id == shot.id {
             goHome()
         }
+    }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        NSLog("[GolfTraceAppDelegate] didFinishLaunching，delegate 已生效")
+        return true
+    }
+}
+
+// MARK: - 登录 → 主界面过渡（纯变换动画，无离屏遮罩，高刷屏不丢帧）
+
+private struct ScreenTransitionModifier: ViewModifier, Animatable {
+    var scale: CGFloat
+    var opacity: Double
+    var offsetY: CGFloat
+
+    var animatableData: AnimatablePair<AnimatablePair<CGFloat, Double>, CGFloat> {
+        get { AnimatablePair(AnimatablePair(scale, opacity), offsetY) }
+        set {
+            scale = newValue.first.first
+            opacity = newValue.first.second
+            offsetY = newValue.second
+        }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(scale)
+            .opacity(opacity)
+            .offset(y: offsetY)
+    }
+}
+
+extension AnyTransition {
+    /// 登录页退出：轻微放大 + 淡出（像镜头穿过屏幕进入 App）
+    static var loginZoomOut: AnyTransition {
+        .modifier(
+            active: ScreenTransitionModifier(scale: 1.08, opacity: 0, offsetY: 0),
+            identity: ScreenTransitionModifier(scale: 1, opacity: 1, offsetY: 0)
+        )
+    }
+
+    /// 主界面进入：从小尺寸淡入，弹性回弹到原位
+    static var homeZoomIn: AnyTransition {
+        .modifier(
+            active: ScreenTransitionModifier(scale: 0.9, opacity: 0, offsetY: 28),
+            identity: ScreenTransitionModifier(scale: 1, opacity: 1, offsetY: 0)
+        )
     }
 }

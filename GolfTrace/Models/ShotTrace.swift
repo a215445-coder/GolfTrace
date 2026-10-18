@@ -53,11 +53,17 @@ struct ShotTrace: Codable, Hashable {
     var opacity: Double
     var bendLeft: Double
     var bendRight: Double
+    /// 高度弓起幅度（归一化，正 = 轨迹向上隆起，两端不动、弧长中点最大）
+    var bendHeight: Double
     var colorRed: Double
     var colorGreen: Double
     var colorBlue: Double
     /// 下降段减速幅度（0 = 匀速下降，1 = 明显减速收尾），只影响动画节奏不改几何
     var paceDeceleration: Double
+    /// 是否在轨迹旁显示距离数字
+    var showDistance: Bool
+    /// 用户设定的目标距离（码），播放时数字从 0 逐渐涨到该值
+    var targetDistance: Double
 
     static let defaultColor = (red: 1.0, green: 0.84, blue: 0.0)
     /// 默认轨迹线宽（较细，约为旧默认值 4 的 70%）
@@ -72,10 +78,13 @@ struct ShotTrace: Codable, Hashable {
         opacity: Double = 1,
         bendLeft: Double = 0,
         bendRight: Double = 0,
+        bendHeight: Double = 0,
         colorRed: Double = ShotTrace.defaultColor.red,
         colorGreen: Double = ShotTrace.defaultColor.green,
         colorBlue: Double = ShotTrace.defaultColor.blue,
-        paceDeceleration: Double = 0.6
+        paceDeceleration: Double = 0.6,
+        showDistance: Bool = false,
+        targetDistance: Double = 250
     ) {
         self.points = points
         self.confidence = confidence
@@ -85,10 +94,13 @@ struct ShotTrace: Codable, Hashable {
         self.opacity = opacity
         self.bendLeft = bendLeft
         self.bendRight = bendRight
+        self.bendHeight = bendHeight
         self.colorRed = colorRed
         self.colorGreen = colorGreen
         self.colorBlue = colorBlue
         self.paceDeceleration = paceDeceleration
+        self.showDistance = showDistance
+        self.targetDistance = targetDistance
     }
 
     // 旧版本 JSON 没有样式字段，用默认值兜底保证旧记录可读
@@ -102,10 +114,13 @@ struct ShotTrace: Codable, Hashable {
         opacity = try container.decodeIfPresent(Double.self, forKey: .opacity) ?? 1
         bendLeft = try container.decodeIfPresent(Double.self, forKey: .bendLeft) ?? 0
         bendRight = try container.decodeIfPresent(Double.self, forKey: .bendRight) ?? 0
+        bendHeight = try container.decodeIfPresent(Double.self, forKey: .bendHeight) ?? 0
         colorRed = try container.decodeIfPresent(Double.self, forKey: .colorRed) ?? ShotTrace.defaultColor.red
         colorGreen = try container.decodeIfPresent(Double.self, forKey: .colorGreen) ?? ShotTrace.defaultColor.green
         colorBlue = try container.decodeIfPresent(Double.self, forKey: .colorBlue) ?? ShotTrace.defaultColor.blue
         paceDeceleration = try container.decodeIfPresent(Double.self, forKey: .paceDeceleration) ?? 0.6
+        showDistance = try container.decodeIfPresent(Bool.self, forKey: .showDistance) ?? false
+        targetDistance = try container.decodeIfPresent(Double.self, forKey: .targetDistance) ?? 250
     }
 
     var sortedPoints: [TracePoint] {

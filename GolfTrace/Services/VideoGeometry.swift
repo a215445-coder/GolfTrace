@@ -63,24 +63,29 @@ enum VideoGeometry {
     /// 每段关键点之间的采样密度
     static let trajectoryStepsPerSegment = 16
 
-    /// 根据全部关键点生成平滑轨迹采样点：基础曲线 + 全局弯曲，两遍式计算。
-    /// 第一遍：所有关键点作为一条完整路径，用 Fritsch–Carlson 风格切线 + Hermite 插值
-    /// 生成基础曲线，同时记录每个采样点和每个关键点处的累计弧长。
-    /// 第二遍：全局弯曲——左弯/右弯合并为单一有符号强度 b = bendRight − bendLeft，
-    /// 用全局包络 sin(π·t) 对整条曲线统一施加水平偏移：起点终点偏移为 0、中间最大，
-    /// 形成一条连续的大弧线；所有段共享同一套全局弯曲参数，不做逐段弯曲。
+    /// 侧弯最大水平偏移 = 视频画面宽度的比例（全局侧弯包络的峰值幅度）
+    static let lateralBowMaxRatio = 0.4
+
+    /// 根据全部关键点生成平滑轨迹采样点：基础曲线 + 弦参考系的高度缩放与侧向倾斜。
+    /// 第一遍：所有关键点作为一条完整路径，用 Fritsch–Carlson 风格切线 + Hermite 插值。
+    /// 第二遍（高度缩放 + 侧向偏移）：以离弦高度（相对「起点→终点弦」的垂直距离）为强度——
+    /// 高度 = 离弦高度按 (1 + bendHeight) 缩放，位移沿屏幕竖直方向；
+    /// 侧弯 = 位移沿屏幕水平方向、与离弦高度成正比（b = bendRight − bendLeft 为有符号强度），
+    /// 顶点偏移最大、两端为零，像高尔夫 draw/fade 一样整条弧线向一侧平滑倾斜。
+    /// 两者坐标轴正交、互不干扰；变换对高度场线性：轨迹从头到尾平滑、绝不交叉。
     /// 坐标系无关：输入输出同一坐标系，调用方用归一化或像素坐标均可。
     static func trajectoryGeometry(
         keyPoints: [CGPoint],
         bendLeft: Double,
-        bendRight: Double
+        bendRight: Double,
+        bendHeight: Double = 0
     ) -> TrajectoryGeometry {
         guard keyPoints.count >= 2 else {
             return TrajectoryGeometry(samples: keyPoints, cumulativeLengths: [], keyCumulativeLengths: [])
         }
         let n = keyPoints.count
-        // 全局弯曲强度：左负右正，单一有符号值。
-        // 0.8 次幂映射：低中档位弧度更明显、档位差异清晰；最大档位仍为 1，不放大避免回环。
+        // 弯曲强度：左负右正，单一有符号值。
+        // 0.8 次幂映射：低中档位更明显、档位差异清晰；最大档位为 1（对应最大侧弯幅度）。
         let bend = bendRight - bendLeft
         let bendStrength = bend >= 0 ? pow(bend, 0.8) : -pow(-bend, 0.8)
 
@@ -152,12 +157,12 @@ enum VideoGeometry {
             }
         }
 
-        // 第二步：基础曲线采样（无弯曲），记录采样点与关键点的累计弧长
+        // 第二步：逐段 Hermite 采样并记录累计弧长（侧弯/高度在第三步统一施加）
         let steps = trajectoryStepsPerSegment
-        var baseSamples: [CGPoint] = []
+        var samples: [CGPoint] = []
         var cumulativeLengths: [Double] = []
         var keyCumulativeLengths: [Double] = []
-        baseSamples.reserveCapacity((n - 1) * steps + 1)
+        samples.reserveCapacity((n - 1) * steps + 1)
         cumulativeLengths.reserveCapacity((n - 1) * steps + 1)
         keyCumulativeLengths.reserveCapacity(n)
         var totalLength = 0.0
@@ -173,59 +178,52 @@ enum VideoGeometry {
             for step in 0..<steps {
                 let u = CGFloat(step) / CGFloat(steps)
                 let point = hermitePoint(p1: p1, p2: p2, m1: m1, m2: m2, t: u)
-                if let previous = baseSamples.last {
+                if let previous = samples.last {
                     totalLength += hypot(point.x - previous.x, point.y - previous.y)
                 }
-                baseSamples.append(point)
+                samples.append(point)
                 cumulativeLengths.append(totalLength)
             }
         }
         let lastPoint = keyPoints[n - 1]
-        if let previous = baseSamples.last {
+        if let previous = samples.last {
             totalLength += hypot(lastPoint.x - previous.x, lastPoint.y - previous.y)
         }
-        baseSamples.append(lastPoint)
+        samples.append(lastPoint)
         cumulativeLengths.append(totalLength)
         keyCumulativeLengths.append(totalLength)
 
-        // 第三步：全局弯曲——整条曲线统一偏移，形成一条大弧线
-        let minX = keyPoints.map(\.x).min() ?? 0
-        let maxX = keyPoints.map(\.x).max() ?? 1
-        let minY = keyPoints.map(\.y).min() ?? 0
-        let maxY = keyPoints.map(\.y).max() ?? 1
-        let chordLength = hypot(
-            keyPoints[n - 1].x - keyPoints[0].x,
-            keyPoints[n - 1].y - keyPoints[0].y
-        )
-        let diagonal = hypot(maxX - minX, maxY - minY)
-        // 幅度以整体起点→终点距离为基准（过短时按包围盒对角线兜底）
-        let amplitude = 0.28 * max(chordLength, diagonal * 0.3)
-
-        var samples = baseSamples
-        if bendStrength != 0, totalLength > 0.0001 {
-            for index in samples.indices {
-                let t = cumulativeLengths[index] / totalLength
-                // sin²(πt) 包络：两端斜率为 0，起点终点沿基础方向自然进出，
-                // 强弯曲不会在起止区域与基础曲线方向对抗产生反向弯折
-                let envelope = sin(.pi * t)
-                let offset = bendStrength * envelope * envelope * amplitude
-                samples[index].x = baseSamples[index].x + offset
-            }
-        }
-
-        // clamp：x 按弯曲幅度放宽，y 限制在包围盒内，避免越出合理范围
-        for index in samples.indices {
-            samples[index].x = min(max(samples[index].x, minX - amplitude), maxX + amplitude)
-            samples[index].y = min(max(samples[index].y, minY), maxY)
-        }
-
-        // 方向保持：最终曲线的 x 方向变化只能出现在基础曲线自身变向处。
-        // 弯曲偏移不允许在基础曲线前进的区域制造反向弯折（如强左弯时起点区域的左勾）。
-        for index in 1..<samples.count {
-            let baseDelta = baseSamples[index].x - baseSamples[index - 1].x
-            let finalDelta = samples[index].x - samples[index - 1].x
-            if (baseDelta >= 0 && finalDelta < 0) || (baseDelta <= 0 && finalDelta > 0) {
-                samples[index].x = samples[index - 1].x
+        // 第三步（高度缩放 + 侧向偏移）：以离弦高度为强度做纯轴向变换——
+        // 高度 = 离弦高度按 (1 + bendHeight) 缩放，位移沿屏幕竖直方向；
+        // 侧弯 = 位移沿屏幕水平方向、与离弦高度成正比（顶点偏移最大、两端为零）。
+        // 高度与左右坐标轴正交、互不干扰；变换对高度场线性：绝不交叉、从头到尾平滑。
+        if bendStrength != 0 || bendHeight != 0 {
+            if let frame = bendFrame(samples: samples), frame.apexHeight > 0.0001 {
+                // 侧弯幅度相对画面宽度固定：轨迹在画面里再小也能拉到足够大的弯；
+                // 离弦高度不足 0.15 时按 0.15 折算，避免扁平轨迹剪切过猛
+                let lateralRatio = (bendStrength * lateralBowMaxRatio) / max(frame.apexHeight, 0.15)
+                let firstX = samples[0].x
+                let firstY = samples[0].y
+                for i in samples.indices {
+                    let h = Double(samples[i].x - firstX) * frame.nx + Double(samples[i].y - firstY) * frame.ny
+                    // 纯轴向：左右只动 x、上下只动 y，互不干扰
+                    samples[i].y -= CGFloat(h * bendHeight)
+                    samples[i].x += CGFloat(h * lateralRatio)
+                }
+            } else if let total = cumulativeLengths.last, total > 0 {
+                // 退化兜底（轨迹近似直线、离弦高度为零）：按弧长 sin²(π·u) 包络弓起，
+                // 让只有起点终点的直线也能被弯曲手柄塑形成弧线
+                for i in samples.indices {
+                    let u = cumulativeLengths[i] / total
+                    let envelope = sin(.pi * u)
+                    let envelope2 = envelope * envelope
+                    if bendStrength != 0 {
+                        samples[i].x += CGFloat(bendStrength * lateralBowMaxRatio) * CGFloat(envelope2)
+                    }
+                    if bendHeight != 0 {
+                        samples[i].y -= CGFloat(bendHeight) * CGFloat(envelope2)
+                    }
+                }
             }
         }
 
@@ -234,6 +232,68 @@ enum VideoGeometry {
             cumulativeLengths: cumulativeLengths,
             keyCumulativeLengths: keyCumulativeLengths
         )
+    }
+
+    /// 弯曲参考系：以「起点→终点弦」为基准的坐标框架。
+    /// 返回弦单位方向 (dx, dy)、屏幕上方单位法向 (nx, ny)、顶点采样下标与顶点离弦高度。
+    /// 起点终点重合时退化为水平弦（dx=1, ny=-1），保证弯曲始终可用。
+    static func bendFrame(samples: [CGPoint]) -> (dx: Double, dy: Double, nx: Double, ny: Double, apexIndex: Int, apexHeight: Double)? {
+        guard samples.count >= 2 else { return nil }
+        let first = samples[0]
+        let last = samples[samples.count - 1]
+        let chordX = Double(last.x - first.x)
+        let chordY = Double(last.y - first.y)
+        let chordLength = hypot(chordX, chordY)
+        let dx: Double
+        let dy: Double
+        if chordLength > 0.0001 {
+            dx = chordX / chordLength
+            dy = chordY / chordLength
+        } else {
+            dx = 1
+            dy = 0
+        }
+        var nx = -dy
+        var ny = dx
+        if ny > 0 {
+            nx = -nx
+            ny = -ny
+        }
+        var apexIndex = 0
+        var apexHeight = -Double.greatestFiniteMagnitude
+        for i in samples.indices {
+            let h = Double(samples[i].x - first.x) * nx + Double(samples[i].y - first.y) * ny
+            if h > apexHeight {
+                apexHeight = h
+                apexIndex = i
+            }
+        }
+        return (dx, dy, nx, ny, apexIndex, apexHeight)
+    }
+
+    /// 弯曲编辑手柄下标：顶点 = 离弦高度最大的采样点；
+    /// 侧弯手柄 = 下降侧（顶点之后）离弦高度约为顶点一半的采样点。
+    /// 轨迹近似直线时退化为弧长 1/2 与 3/4 处，保证直线也能被塑形。
+    static func bendHandleIndices(geometry: TrajectoryGeometry, base: TrajectoryGeometry) -> (apex: Int, lateral: Int)? {
+        guard base.samples.count >= 2, geometry.samples.count == base.samples.count,
+              let frame = bendFrame(samples: base.samples) else { return nil }
+        let samples = base.samples
+        let first = samples[0]
+        if frame.apexHeight <= 0.0001 {
+            let mid = samples.count / 2
+            return (mid, min(mid + samples.count / 4, samples.count - 1))
+        }
+        let apex = frame.apexIndex
+        let half = frame.apexHeight / 2
+        var lateral = apex
+        for i in apex..<samples.count {
+            let h = Double(samples[i].x - first.x) * frame.nx + Double(samples[i].y - first.y) * frame.ny
+            if h <= half {
+                lateral = i
+                break
+            }
+        }
+        return (apex, lateral)
     }
 
     /// 把密集采样点转成连续的三次 Bézier 段（Catmull-Rom → Bézier 转换）。
@@ -273,22 +333,28 @@ enum VideoGeometry {
         )
     }
 
-    /// 轨迹动画总时长（秒）：独立动画时间轴，与关键点之间的视频时间间隔无关。
-    /// 无论关键点在视频中相隔 1 秒还是 5 秒，整条轨迹都以相同节奏绘制。
-    static let paceTotalDuration: TimeInterval = 7.0
+    /// 上升段绝对时长（秒）：快速跟球，幂函数前快后缓
+    static let paceRiseDuration: TimeInterval = 0.75
+    /// 下降段绝对时长（秒）：匀速、较缓
+    static let paceDescentDuration: TimeInterval = 9.0
+    /// 无顶点（两点轨迹）时的固定总时长
+    static let paceFlatDuration: TimeInterval = 7.0
+    /// 下降段起始平滑过渡占比（从上升末端速率过渡到匀速速率）
+    static let paceDescentBlendFraction = 0.25
 
-    /// 下降段平均延伸速度相对上升段的比值（下降段明显更慢）。
-    static let paceDescentSpeedRatio = 0.6
+    /// 上升段缓动指数（幂函数前快后缓）：越小上升越急促、越跟球。
+    /// 同时用于解出顶点时间占比，保证上升段末端斜率与匀速下降段斜率在顶点处连续
+    static let paceRiseAlpha = 0.18
 
     /// 播放进度 → 轨迹采样截取长度（独立动画时间轴 + 归一化弧长）。
     /// 几何路径始终由全部关键点生成；动画进度以「整条曲线的弧长」为基准：
-    /// - 动画时间轴与视频时间轴分离：总时长固定为 paceTotalDuration，
-    ///   视频时间只用于确定「何时开始绘制」和关键点对应的画面帧，
-    ///   不参与任何速度计算（关键点视频间隔不影响轨迹运动快慢）；
-    /// - 上升段（起点→最高点）：幂函数前快后缓；
-    /// - 下降段（最高点→落点）：顶点处时间占比由 paceDescentSpeedRatio 反推
-    ///   （平均速度 = 上升段的 60%），Hermite 映射保证顶点速度连续，
-    ///   接近落点时进一步减速（幅度由 paceDeceleration 控制）。
+    /// - 动画时间轴与视频时间轴分离：有顶点时总时长 = 上升段固定时长 + 下降段时长，
+    ///   视频时间只用于确定「何时开始绘制」；关键点视频间隔不影响轨迹运动快慢；
+    /// - 上升段（起点→最高点）：固定时长 paceRiseDuration，幂函数前快后缓、快速跟球；
+    /// - 下降段（最高点→落点）：先平滑过渡到匀速速率，之后全程匀速、无减速收尾，
+    ///   时长较长（paceDescentDuration）、缓缓落下；
+    /// - 无顶点的两点轨迹：固定总时长匀速绘制；
+    /// - 视频余量不足时压缩总时长，保证视频结束前画完（上升段真实时长保持不变）。
     /// 最高点由关键点几何（y 最小）识别，与视频时间无关。
     /// 返回 nil 表示绘制完整曲线；返回 0 表示尚未开始、不绘制；
     /// 否则返回**分数采样位置**（如 42.7），调用方在采样点之间插值，
@@ -302,14 +368,6 @@ enum VideoGeometry {
     ) -> Double? {
         guard let totalLength = geometry.cumulativeLengths.last, totalLength > 0 else { return nil }
         guard let tStart = keyPoints.first?.time else { return nil }
-        // 独立动画时间轴：总时长固定；仅当视频余量不足时压缩，保证视频结束前画完
-        var total = paceTotalDuration
-        if videoDuration > 0 {
-            total = max(min(total, videoDuration - tStart), 1.0)
-        }
-        let s = min(max((clipTime - tStart) / total, 0), 1)
-        if s <= 0 { return 0 }
-        if s >= 1 { return nil }
 
         // 识别最高点：y 最小的中间关键点（仅作缓动分界，不影响几何）
         var apexIndex: Int?
@@ -321,14 +379,22 @@ enum VideoGeometry {
             }
         }
 
+        // 独立动画时间轴：有顶点时上升段固定时长（快速跟球）、下降段匀速且时长较长（较缓）；
+        // 无顶点时固定总时长；视频余量不足时压缩，保证视频结束前画完
+        var total = apexIndex != nil ? paceRiseDuration + paceDescentDuration : paceFlatDuration
+        if videoDuration > 0 {
+            total = max(min(total, videoDuration - tStart), 1.0)
+        }
+        let s = min(max((clipTime - tStart) / total, 0), 1)
+        if s <= 0 { return 0 }
+        if s >= 1 { return nil }
+
         var q = s
         if let apex = apexIndex {
             let qApex = geometry.keyCumulativeLengths[apex] / totalLength
             if qApex > 0.02, qApex < 0.98 {
-                // 由下降段/上升段平均速度比反推顶点处的绘制时间占比
-                let ratio = paceDescentSpeedRatio
-                var sApex = ratio * qApex / (1 - qApex + ratio * qApex)
-                sApex = min(max(sApex, 0.05), 0.95)
+                // 顶点时间占比 = 上升段固定时长 / 总时长（视频压缩时上升段真实时长不变）
+                let sApex = min(max(paceRiseDuration / total, 0.03), 0.9)
                 q = easedArcFraction(
                     s: s,
                     apexArcFraction: qApex,
@@ -357,37 +423,35 @@ enum VideoGeometry {
     }
 
     /// 分段缓动映射：归一化视频时间 s ∈ [0,1] → 归一化弧长 q ∈ [0,1]。
-    /// 上升段 q = qA·(s/sA)^α（α=0.7，前快后缓）；
-    /// 下降段用 Hermite 过渡，顶点处斜率与上升段连续，落点处斜率按减速参数降低。
+    /// 上升段 q = qA·(s/sA)^α（前快后缓）；
+    /// 下降段：先按 smoothstep 从上升末端速率平滑过渡到匀速速率（顶点处速度连续），
+    /// 之后全程匀速、速率恒定、无减速收尾。
+    /// deceleration 参数保留兼容（匀速下降不再使用）。
     static func easedArcFraction(
         s: Double,
         apexArcFraction qApex: Double,
         apexTimeFraction sApex: Double,
         deceleration: Double
     ) -> Double {
-        let alpha = 0.7
         if s <= sApex {
             guard sApex > 0 else { return 0 }
-            return qApex * pow(s / sApex, alpha)
+            return qApex * pow(s / sApex, paceRiseAlpha)
         }
         let u = (s - sApex) / (1 - sApex)
-        // 顶点处斜率连续：上升段末端斜率 = 下降段起始斜率
-        let d0 = qApex * alpha / sApex * (1 - sApex) / (1 - qApex)
-        // 落点处斜率：按减速参数降低（0 = 匀速下降，1 = 明显减速收尾）
-        let decel = min(max(deceleration, 0), 1)
-        let d1 = d0 * (1 - 0.85 * decel)
-        let f = scalarHermite(p0: 0, p1: 1, m0: min(d0, 3), m1: d1, t: u)
-        return qApex + (1 - qApex) * f
-    }
-
-    /// 标量 Hermite 插值：f(0)=p0，f(1)=p1，两端斜率 m0/m1
-    static func scalarHermite(p0: Double, p1: Double, m0: Double, m1: Double, t: Double) -> Double {
-        let t2 = t * t
-        let t3 = t2 * t
-        let h00 = 2 * t3 - 3 * t2 + 1
-        let h10 = t3 - 2 * t2 + t
-        let h01 = -2 * t3 + 3 * t2
-        let h11 = t3 - t2
-        return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
+        // 上升段末端速率（弧长/归一化时间）与下降段平均速率
+        let riseEndSpeed = qApex * paceRiseAlpha / sApex
+        let meanSpeed = (1 - qApex) / (1 - sApex)
+        // 匀速阶段速率：由「过渡段均值 + 匀速段均值 = 下降段平均速率」解出
+        let b = paceDescentBlendFraction
+        let targetSpeed = max((meanSpeed - b * riseEndSpeed / 2) / (1 - b / 2), 0.02)
+        if u <= b {
+            // 过渡段：速率从 riseEndSpeed 平滑过渡到 targetSpeed，积分可解析
+            let t = u / b
+            let integral = riseEndSpeed * u + (targetSpeed - riseEndSpeed) * b * (t * t * t - t * t * t * t / 2)
+            return qApex + (1 - sApex) * integral
+        }
+        // 匀速段：恒定速率 targetSpeed
+        let blendArc = riseEndSpeed * b + (targetSpeed - riseEndSpeed) * b / 2
+        return qApex + (1 - sApex) * (blendArc + targetSpeed * (u - b))
     }
 }
