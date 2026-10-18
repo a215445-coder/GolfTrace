@@ -1,0 +1,12 @@
+.DS_Store
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+build/
+.swiftpm/
+.vscode/
+.env
+*.mov
+*.mp4
